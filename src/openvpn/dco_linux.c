@@ -64,7 +64,15 @@ static int mcast_family_handler(struct nl_msg *msg, void *arg);
 static int dco_parse_peer_multi(struct nl_msg *msg, void *arg);
 static int dco_parse_peer(struct nl_msg *msg, void *arg);
 
+/* Forward declarations for immediate processing in callback */
+void multi_process_incoming_dco(dco_context_t *dco);
+void process_incoming_dco(dco_context_t *dco);
+
 void dco_check_key_ctx(const struct key_ctx_bi *key);
+
+/* Lock to prevent recursive stats requests during message processing.
+ * When set, dco_get_peer_stats() returns early to avoid NLE_BUSY errors. */
+static bool __is_locked = false;
 
 /**
  * @brief resolves the netlink ID for ovpn-dco
@@ -133,7 +141,9 @@ nla_put_failure:
 static int
 ovpn_nl_recvmsgs(dco_context_t *dco, const char *prefix)
 {
+    __is_locked = true;
     int ret = nl_recvmsgs(dco->nl_sock, dco->nl_cb);
+    __is_locked = false;
 
     switch (ret)
     {
@@ -846,16 +856,27 @@ ovpn_handle_msg(struct nl_msg *msg, void *arg)
             return NL_SKIP;
     }
 
-    /* Return NL_STOP to process one message at a time. This prevents
-     * losing messages when multiple arrive simultaneously. */
-    return NL_STOP;
+    /* Process each message immediately to prevent data loss when multiple
+     * messages arrive simultaneously. Previously, storing in dco fields and
+     * processing later caused only the last message to be handled. */
+    if (dco->c && dco->c->mode == CM_TOP)
+    {
+        multi_process_incoming_dco(dco);
+    }
+    else if (dco->c)
+    {
+        process_incoming_dco(dco);
+    }
+
+    return NL_OK;
 }
 
 int
-dco_do_read(dco_context_t *dco)
+dco_read_and_process(dco_context_t *dco)
 {
     msg(D_DCO_DEBUG, __func__);
-    /* Callback permanently registered in ovpn_dco_init_netlink() */
+    /* Callback permanently registered in ovpn_dco_init_netlink().
+     * Each message is processed immediately inside ovpn_handle_msg(). */
     return ovpn_nl_recvmsgs(dco, __func__);
 }
 
@@ -966,6 +987,12 @@ dco_get_peer_stats_multi(dco_context_t *dco, struct multi_context *m)
 {
     msg(D_DCO_DEBUG, "%s", __func__);
 
+    /* Skip stats request if we're processing DCO messages to avoid recursion */
+    if (__is_locked)
+    {
+        return 0;
+    }
+
     struct nl_msg *nl_msg = ovpn_dco_nlmsg_create(dco, OVPN_CMD_GET_PEER);
 
     nlmsg_hdr(nl_msg)->nlmsg_flags |= NLM_F_DUMP;
@@ -1034,6 +1061,12 @@ dco_get_peer_stats(struct context *c)
     msg(D_DCO_DEBUG, "%s: peer-id %d", __func__, peer_id);
 
     if (!c->c1.tuntap)
+    {
+        return 0;
+    }
+
+    /* Skip stats request if we're processing DCO messages to avoid recursion */
+    if (__is_locked)
     {
         return 0;
     }
