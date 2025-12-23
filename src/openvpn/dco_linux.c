@@ -59,10 +59,12 @@
     nla_nest_start(_msg, (_type) | NLA_F_NESTED)
 
 static int ovpn_get_mcast_id(dco_context_t *dco);
+static int ovpn_handle_msg(struct nl_msg *msg, void *arg);
+static int mcast_family_handler(struct nl_msg *msg, void *arg);
+static int dco_parse_peer_multi(struct nl_msg *msg, void *arg);
+static int dco_parse_peer(struct nl_msg *msg, void *arg);
 
 void dco_check_key_ctx(const struct key_ctx_bi *key);
-
-typedef int (*ovpn_nl_cb)(struct nl_msg *msg, void *arg);
 
 /**
  * @brief resolves the netlink ID for ovpn-dco
@@ -167,23 +169,22 @@ ovpn_nl_recvmsgs(dco_context_t *dco, const char *prefix)
 }
 
 /**
- * Send a prepared netlink message and registers cb as callback if non-null.
+ * Send a prepared netlink message.
  *
- * The method will also free nl_msg
+ * The callback is permanently registered in ovpn_dco_init_netlink() and routes
+ * messages to appropriate handlers based on type.
+ *
  * @param dco       The dco context to use
  * @param nl_msg    the message to use
- * @param cb        An optional callback if the caller expects an answer
- * @param cb_arg    An optional param to pass to the callback
  * @param prefix    A prefix to report in the error message to give the user context
  * @return          status of sending the message
  */
 static int
-ovpn_nl_msg_send(dco_context_t *dco, struct nl_msg *nl_msg, ovpn_nl_cb cb,
-                 void *cb_arg, const char *prefix)
+ovpn_nl_msg_send(dco_context_t *dco, struct nl_msg *nl_msg, const char *prefix)
 {
     dco->status = 1;
 
-    nl_cb_set(dco->nl_cb, NL_CB_VALID, NL_CB_CUSTOM, cb, cb_arg);
+    /* Callback permanently set in ovpn_dco_init_netlink() - don't register here */
     nl_send_auto(dco->nl_sock, nl_msg);
 
     while (dco->status == 1)
@@ -274,7 +275,7 @@ dco_new_peer(dco_context_t *dco, unsigned int peerid, int sd,
     }
     nla_nest_end(nl_msg, attr);
 
-    ret = ovpn_nl_msg_send(dco, nl_msg, NULL, NULL, __func__);
+    ret = ovpn_nl_msg_send(dco, nl_msg, __func__);
 
 nla_put_failure:
     nlmsg_free(nl_msg);
@@ -378,6 +379,14 @@ ovpn_dco_init_netlink(dco_context_t *dco)
               &dco->status);
     nl_cb_set(dco->nl_cb, NL_CB_ACK, NL_CB_CUSTOM, ovpn_nl_cb_finish,
               &dco->status);
+
+    /* Store NLCTRL family ID for message routing in dispatcher */
+    dco->ctrlid = genl_ctrl_resolve(dco->nl_sock, "nlctrl");
+
+    /* Register permanent callback - all messages route through ovpn_handle_msg.
+     * This prevents message loss when async notifications (like DEL_PEER) arrive
+     * while a different callback would otherwise be registered for stats requests. */
+    nl_cb_set(dco->nl_cb, NL_CB_VALID, NL_CB_CUSTOM, ovpn_handle_msg, dco);
 
     /* The async PACKET messages confuse libnl and it will drop them with
      * wrong sequence numbers (NLE_SEQ_MISMATCH), so disable libnl's sequence
@@ -495,7 +504,7 @@ dco_swap_keys(dco_context_t *dco, unsigned int peerid)
     NLA_PUT_U32(nl_msg, OVPN_SWAP_KEYS_ATTR_PEER_ID, peerid);
     nla_nest_end(nl_msg, attr);
 
-    ret = ovpn_nl_msg_send(dco, nl_msg, NULL, NULL, __func__);
+    ret = ovpn_nl_msg_send(dco, nl_msg, __func__);
 
 nla_put_failure:
     nlmsg_free(nl_msg);
@@ -519,7 +528,7 @@ dco_del_peer(dco_context_t *dco, unsigned int peerid)
     NLA_PUT_U32(nl_msg, OVPN_DEL_PEER_ATTR_PEER_ID, peerid);
     nla_nest_end(nl_msg, attr);
 
-    ret = ovpn_nl_msg_send(dco, nl_msg, NULL, NULL, __func__);
+    ret = ovpn_nl_msg_send(dco, nl_msg, __func__);
 
 nla_put_failure:
     nlmsg_free(nl_msg);
@@ -545,7 +554,7 @@ dco_del_key(dco_context_t *dco, unsigned int peerid,
     NLA_PUT_U8(nl_msg, OVPN_DEL_KEY_ATTR_KEY_SLOT, slot);
     nla_nest_end(nl_msg, attr);
 
-    ret = ovpn_nl_msg_send(dco, nl_msg, NULL, NULL, __func__);
+    ret = ovpn_nl_msg_send(dco, nl_msg, __func__);
 
 nla_put_failure:
     nlmsg_free(nl_msg);
@@ -602,7 +611,7 @@ dco_new_key(dco_context_t *dco, unsigned int peerid, int keyid,
 
     nla_nest_end(nl_msg, attr);
 
-    ret = ovpn_nl_msg_send(dco, nl_msg, NULL, NULL, __func__);
+    ret = ovpn_nl_msg_send(dco, nl_msg, __func__);
 
 nla_put_failure:
     nlmsg_free(nl_msg);
@@ -631,7 +640,7 @@ dco_set_peer(dco_context_t *dco, unsigned int peerid,
                 keepalive_timeout);
     nla_nest_end(nl_msg, attr);
 
-    ret = ovpn_nl_msg_send(dco, nl_msg, NULL, NULL, __func__);
+    ret = ovpn_nl_msg_send(dco, nl_msg, __func__);
 
 nla_put_failure:
     nlmsg_free(nl_msg);
@@ -697,37 +706,61 @@ ovpn_get_mcast_id(dco_context_t *dco)
 {
     dco->ovpn_dco_mcast_id = -ENOENT;
 
-    /* Even though 'nlctrl' is a constant, there seem to be no library
-     * provided define for it */
-    int ctrlid = genl_ctrl_resolve(dco->nl_sock, "nlctrl");
-
     struct nl_msg *nl_msg = nlmsg_alloc();
     if (!nl_msg)
     {
         return -ENOMEM;
     }
 
-    genlmsg_put(nl_msg, 0, 0, ctrlid, 0, 0, CTRL_CMD_GETFAMILY, 0);
+    /* Use ctrlid stored in dco during init */
+    genlmsg_put(nl_msg, 0, 0, dco->ctrlid, 0, 0, CTRL_CMD_GETFAMILY, 0);
 
     int ret = -EMSGSIZE;
     NLA_PUT_STRING(nl_msg, CTRL_ATTR_FAMILY_NAME, OVPN_NL_NAME);
 
-    ret = ovpn_nl_msg_send(dco, nl_msg, mcast_family_handler, dco, __func__);
+    ret = ovpn_nl_msg_send(dco, nl_msg, __func__);
 
 nla_put_failure:
     nlmsg_free(nl_msg);
     return ret;
 }
 
-/* This function parses any netlink message sent by ovpn-dco to userspace */
+/**
+ * Central message dispatcher for all netlink messages.
+ *
+ * This function is registered as the permanent NL_CB_VALID callback and routes
+ * messages to appropriate handlers based on type. This prevents message loss
+ * when async notifications (like DEL_PEER) arrive during other operations.
+ */
 static int
 ovpn_handle_msg(struct nl_msg *msg, void *arg)
 {
     dco_context_t *dco = arg;
-
-    struct genlmsghdr *gnlh = nlmsg_data(nlmsg_hdr(msg));
-    struct nlattr *attrs[OVPN_ATTR_MAX + 1];
     struct nlmsghdr *nlh = nlmsg_hdr(msg);
+    struct genlmsghdr *gnlh = nlmsg_data(nlh);
+
+    /* Route NLCTRL messages to mcast handler */
+    if (nlh->nlmsg_type == dco->ctrlid)
+    {
+        return mcast_family_handler(msg, dco);
+    }
+
+    /* Route GET_PEER responses to stats handlers */
+    if (gnlh->cmd == OVPN_CMD_GET_PEER)
+    {
+        if (dco->m)
+        {
+            return dco_parse_peer_multi(msg, dco);
+        }
+        else if (dco->c)
+        {
+            return dco_parse_peer(msg, dco);
+        }
+        return NL_SKIP;
+    }
+
+    /* Handle async notifications (DEL_PEER, etc.) */
+    struct nlattr *attrs[OVPN_ATTR_MAX + 1];
 
     if (!genlmsg_valid_hdr(nlh, 0))
     {
@@ -813,15 +846,16 @@ ovpn_handle_msg(struct nl_msg *msg, void *arg)
             return NL_SKIP;
     }
 
-    return NL_OK;
+    /* Return NL_STOP to process one message at a time. This prevents
+     * losing messages when multiple arrive simultaneously. */
+    return NL_STOP;
 }
 
 int
 dco_do_read(dco_context_t *dco)
 {
     msg(D_DCO_DEBUG, __func__);
-    nl_cb_set(dco->nl_cb, NL_CB_VALID, NL_CB_CUSTOM, ovpn_handle_msg, dco);
-
+    /* Callback permanently registered in ovpn_dco_init_netlink() */
     return ovpn_nl_recvmsgs(dco, __func__);
 }
 
@@ -877,13 +911,21 @@ dco_update_peer_stat(struct context_2 *c2, struct nlattr *tb[], uint32_t id)
     }
 }
 
-int
+static int
 dco_parse_peer_multi(struct nl_msg *msg, void *arg)
 {
+    dco_context_t *dco = arg;
+    struct multi_context *m = dco->m;
     struct nlattr *tb[OVPN_ATTR_MAX + 1];
     struct genlmsghdr *gnlh = nlmsg_data(nlmsg_hdr(msg));
 
     msg(D_DCO_DEBUG, "%s: parsing message...", __func__);
+
+    if (!m)
+    {
+        msg(D_DCO_DEBUG, "%s: no multi context set", __func__);
+        return NL_SKIP;
+    }
 
     nla_parse(tb, OVPN_ATTR_MAX, genlmsg_attrdata(gnlh, 0),
               genlmsg_attrlen(gnlh, 0), NULL);
@@ -905,7 +947,6 @@ dco_parse_peer_multi(struct nl_msg *msg, void *arg)
         return NL_SKIP;
     }
 
-    struct multi_context *m = arg;
     uint32_t peer_id = nla_get_u32(tb_peer[OVPN_GET_PEER_RESP_ATTR_PEER_ID]);
 
     if (peer_id >= m->max_clients || !m->instances[peer_id])
@@ -929,7 +970,10 @@ dco_get_peer_stats_multi(dco_context_t *dco, struct multi_context *m)
 
     nlmsg_hdr(nl_msg)->nlmsg_flags |= NLM_F_DUMP;
 
-    int ret = ovpn_nl_msg_send(dco, nl_msg, dco_parse_peer_multi, m, __func__);
+    /* Store context for dispatcher to route to dco_parse_peer_multi */
+    dco->m = m;
+    int ret = ovpn_nl_msg_send(dco, nl_msg, __func__);
+    dco->m = NULL;
 
     nlmsg_free(nl_msg);
     return ret;
@@ -938,11 +982,18 @@ dco_get_peer_stats_multi(dco_context_t *dco, struct multi_context *m)
 static int
 dco_parse_peer(struct nl_msg *msg, void *arg)
 {
-    struct context *c = arg;
+    dco_context_t *dco = arg;
+    struct context *c = dco->c;
     struct nlattr *tb[OVPN_ATTR_MAX + 1];
     struct genlmsghdr *gnlh = nlmsg_data(nlmsg_hdr(msg));
 
     msg(D_DCO_DEBUG, "%s: parsing message...", __func__);
+
+    if (!c)
+    {
+        msg(D_DCO_DEBUG, "%s: no context set", __func__);
+        return NL_SKIP;
+    }
 
     nla_parse(tb, OVPN_ATTR_MAX, genlmsg_attrdata(gnlh, 0),
               genlmsg_attrlen(gnlh, 0), NULL);
@@ -995,7 +1046,10 @@ dco_get_peer_stats(struct context *c)
     NLA_PUT_U32(nl_msg, OVPN_GET_PEER_ATTR_PEER_ID, peer_id);
     nla_nest_end(nl_msg, attr);
 
-    ret = ovpn_nl_msg_send(dco, nl_msg, dco_parse_peer, c, __func__);
+    /* Store context for dispatcher to route to dco_parse_peer */
+    dco->c = c;
+    ret = ovpn_nl_msg_send(dco, nl_msg, __func__);
+    dco->c = NULL;
 
 nla_put_failure:
     nlmsg_free(nl_msg);
